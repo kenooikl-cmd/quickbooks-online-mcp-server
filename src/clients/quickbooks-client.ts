@@ -40,20 +40,70 @@ const TOKEN_STORE_PATH =
 // REFRESH_TOKEN / REALM_ID even when the host config has those keys set to "".
 dotenv.config({ path: TOKEN_STORE_PATH, override: true });
 
+const ENCRYPTED_VALUE_PREFIX = 'enc:v1:';
+
+function loadTokenEncryptionKey(required: boolean): Buffer | undefined {
+  const keyPath = process.env.QUICKBOOKS_TOKEN_ENCRYPTION_KEY_PATH?.trim();
+  if (!keyPath) {
+    if (required) {
+      throw new Error(
+        'QUICKBOOKS_TOKEN_ENCRYPTION_KEY_PATH must point to a separate 32-byte key file in production'
+      );
+    }
+    return undefined;
+  }
+  if (!path.isAbsolute(keyPath)) {
+    throw new Error(`QUICKBOOKS_TOKEN_ENCRYPTION_KEY_PATH must be absolute, got "${keyPath}"`);
+  }
+
+  const encoded = fs.readFileSync(keyPath, 'utf8').trim();
+  const key = Buffer.from(encoded, 'base64url');
+  if (key.length !== 32) {
+    throw new Error('QuickBooks token encryption key must decode to exactly 32 bytes');
+  }
+  return key;
+}
+
+function encryptStoredValue(value: string, required: boolean): string {
+  const key = loadTokenEncryptionKey(required);
+  if (!key) return value;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${ENCRYPTED_VALUE_PREFIX}${iv.toString('base64url')}:${tag.toString('base64url')}:${ciphertext.toString('base64url')}`;
+}
+
+function decryptStoredValue(value?: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || !trimmed.startsWith(ENCRYPTED_VALUE_PREFIX)) return trimmed || undefined;
+
+  const key = loadTokenEncryptionKey(true)!;
+  const parts = trimmed.slice(ENCRYPTED_VALUE_PREFIX.length).split(':');
+  if (parts.length !== 3) throw new Error('Malformed encrypted QuickBooks token value');
+  const [ivText, tagText, ciphertextText] = parts;
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivText, 'base64url'));
+  decipher.setAuthTag(Buffer.from(tagText, 'base64url'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(ciphertextText, 'base64url')),
+    decipher.final(),
+  ]).toString('utf8');
+}
+
 // Register once at module level — registering inside startOAuthFlow() would
 // accumulate duplicate handlers on every OAuth call.
 process.on('uncaughtException', (err) => {
-  console.error('[auth-server] uncaughtException:', err);
+  console.error('[auth-server] uncaughtException:', err instanceof Error ? err.message : 'unknown error');
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('[auth-server] unhandledRejection:', reason);
+  console.error('[auth-server] unhandledRejection:', reason instanceof Error ? reason.message : 'unknown error');
 });
 
 const client_id = process.env.QUICKBOOKS_CLIENT_ID;
 const client_secret = process.env.QUICKBOOKS_CLIENT_SECRET;
-const refresh_token = process.env.QUICKBOOKS_REFRESH_TOKEN;
-const realm_id = process.env.QUICKBOOKS_REALM_ID;
 const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox';
+const refresh_token = decryptStoredValue(process.env.QUICKBOOKS_REFRESH_TOKEN);
+const realm_id = decryptStoredValue(process.env.QUICKBOOKS_REALM_ID);
 // Fix for Issue #5: Use env var with underscore (QUICKBOOKS_REDIRECT_URI)
 const redirect_uri = process.env.QUICKBOOKS_REDIRECT_URI || 'http://localhost:8000/callback';
 
@@ -134,8 +184,7 @@ export class QuickbooksClient {
       // slice would keep quotes/comments and could poison a valid token with a
       // value that only looks different.
       const parsed = dotenv.parse(fs.readFileSync(TOKEN_STORE_PATH));
-      const value = parsed.QUICKBOOKS_REFRESH_TOKEN?.trim();
-      return value || undefined;
+      return decryptStoredValue(parsed.QUICKBOOKS_REFRESH_TOKEN);
     } catch {
       return undefined;
     }
@@ -232,29 +281,19 @@ export class QuickbooksClient {
   }
 
   // The actionable error surfaced when a production server's refresh token is
-  // dead. The interactive localhost flow cannot recover it — Intuit rejects the
-  // localhost redirect for production apps, and no human is present to complete
-  // a browser login in a host-spawned stdio subprocess — so we fail with
-  // instructions instead of opening a browser window that can never succeed.
+  // dead. Reauthorization is performed by running the dedicated auth command
+  // with the configured public HTTPS callback available through a tunnel.
   private reauthError(cause?: string): Error {
     const msg =
       'QuickBooks authorization is invalid or expired and cannot be renewed automatically in ' +
-      'production. Re-authorize this company using a public HTTPS redirect (see the "Production ' +
-      'Setup" section of the README), then restart the server. Note: an HTTP 401 from the token ' +
+      'production; it must be renewed interactively. Run the auth command with the configured public HTTPS redirect available ' +
+      '(see the "Production Setup" section of the README), then restart the server. Note: an HTTP 401 from the token ' +
       'endpoint usually means invalid_client — verify QUICKBOOKS_CLIENT_ID and ' +
       'QUICKBOOKS_CLIENT_SECRET before re-authorizing.';
     return new Error(cause ? `${msg} (cause: ${cause})` : msg);
   }
 
   private async startOAuthFlow(): Promise<void> {
-    // The interactive flow below binds a localhost callback server, but Intuit
-    // rejects localhost redirect URIs for production apps — so this can only
-    // ever succeed in sandbox. Fail fast with guidance rather than opening a
-    // doomed browser window on a production server.
-    if (this.environment === 'production') {
-      throw this.reauthError();
-    }
-
     if (this.isAuthenticating) {
       return;
     }
@@ -262,16 +301,24 @@ export class QuickbooksClient {
     this.isAuthenticating = true;
     const port = 8000;
 
-    // The local server below receives the callback, so the authorize/exchange
-    // pair must use the localhost redirect even when QUICKBOOKS_REDIRECT_URI
-    // points elsewhere (e.g. the OAuth playground used for manual token
-    // generation). Intuit rejects the exchange if the redirect_uri does not
-    // match the one used in the authorize request.
+    // Sandbox can receive localhost directly. Production uses a registered
+    // public HTTPS URL (normally an HTTPS tunnel forwarding to this port).
+    // Authorization and token exchange must use the exact same redirect URI.
+    const flowRedirectUri = this.environment === 'production'
+      ? this.redirectUri
+      : `http://localhost:${port}/callback`;
+    if (this.environment === 'production') {
+      const parsedRedirect = new URL(flowRedirectUri);
+      if (parsedRedirect.protocol !== 'https:' || parsedRedirect.pathname !== '/callback') {
+        throw new Error('Production QUICKBOOKS_REDIRECT_URI must be a public HTTPS URL ending in /callback');
+      }
+      loadTokenEncryptionKey(true);
+    }
     const flowClient = new OAuthClient({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
       environment: this.environment,
-      redirectUri: `http://localhost:${port}/callback`,
+      redirectUri: flowRedirectUri,
     });
 
     return new Promise((resolve, reject) => {
@@ -292,12 +339,35 @@ export class QuickbooksClient {
 
       // Create temporary server for OAuth callback
       const server = http.createServer(async (req, res) => {
-        console.log(`[auth-server] ${req.method} ${req.url}`);
+        const requestUrl = new URL(req.url || '/', `http://localhost:${port}`);
+        console.log(`[auth-server] ${req.method} ${requestUrl.pathname}`);
+
+        // OAuth callbacks are redirected immediately to a clean URL before any
+        // HTML is returned, so authorization codes never appear in Referer
+        // headers for page assets or subsequent navigation.
+        if (requestUrl.pathname === '/success') {
+          res.writeHead(200, {
+            'Content-Type': 'text/html',
+            'Cache-Control': 'no-store, no-cache, max-age=0',
+            'Referrer-Policy': 'no-referrer',
+          });
+          res.end('<html><body style="font-family:Arial;text-align:center;margin-top:20vh"><h2>Successfully connected to QuickBooks.</h2><p>You can close this window now.</p></body></html>');
+          return;
+        }
+        if (requestUrl.pathname === '/error') {
+          res.writeHead(200, {
+            'Content-Type': 'text/html',
+            'Cache-Control': 'no-store, no-cache, max-age=0',
+            'Referrer-Policy': 'no-referrer',
+          });
+          res.end('<html><body style="font-family:Arial;text-align:center;margin-top:20vh"><h2>QuickBooks connection failed.</h2><p>Return to the terminal for details.</p></body></html>');
+          return;
+        }
 
         // Respond to anything that isn't /callback so diagnostic probes (curl,
         // ngrok health checks, favicon requests, etc.) don't hang the server.
-        if (!req.url?.startsWith('/callback')) {
-          res.writeHead(404, { 'Content-Type': 'text/plain' });
+        if (requestUrl.pathname !== '/callback') {
+          res.writeHead(404, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
           res.end('Not Found. Waiting for QuickBooks OAuth callback at /callback');
           return;
         }
@@ -306,11 +376,11 @@ export class QuickbooksClient {
         // request, before touching codeExchangeStarted, so a spoofed/scanner
         // hit can't consume the one-shot exchange lock and lock out the real
         // callback that follows it.
-        const incomingState = new URL(req.url, `http://localhost:${port}`).searchParams.get('state');
+        const incomingState = requestUrl.searchParams.get('state');
         if (incomingState !== expectedState) {
-          console.log(`[auth-server] Rejected callback with mismatched state (got: ${incomingState ?? 'none'})`);
-          res.writeHead(400, { 'Content-Type': 'text/plain' });
-          res.end('Invalid or missing state parameter.');
+          console.log('[auth-server] Rejected callback with mismatched or missing state');
+          res.writeHead(302, { Location: '/error', 'Cache-Control': 'no-store' });
+          res.end();
           return;
         }
 
@@ -319,15 +389,15 @@ export class QuickbooksClient {
         // is set synchronously before the first `await`, so the second request's
         // handler observes it and bails out here.
         if (codeExchangeStarted) {
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<html><body style="font-family:Arial;text-align:center;margin-top:20vh"><h2>Processing… you can close this window.</h2></body></html>');
+          res.writeHead(302, { Location: '/success', 'Cache-Control': 'no-store' });
+          res.end();
           return;
         }
         codeExchangeStarted = true;
 
         {
           try {
-            const response = await flowClient.createToken(req.url);
+            const response = await flowClient.createToken(req.url!);
             const tokens = response.token;
 
             // Save tokens
@@ -335,25 +405,8 @@ export class QuickbooksClient {
             this.realmId = tokens.realmId;
             this.saveTokensToEnv();
 
-            // Send success response
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(`
-              <html>
-                <body style="
-                  display: flex;
-                  flex-direction: column;
-                  justify-content: center;
-                  align-items: center;
-                  height: 100vh;
-                  margin: 0;
-                  font-family: Arial, sans-serif;
-                  background-color: #f5f5f5;
-                ">
-                  <h2 style="color: #2E8B57;">✓ Successfully connected to QuickBooks!</h2>
-                  <p>You can close this window now.</p>
-                </body>
-              </html>
-            `);
+            res.writeHead(302, { Location: '/success', 'Cache-Control': 'no-store' });
+            res.end();
 
             // Close server after a short delay
             setTimeout(() => {
@@ -362,25 +415,9 @@ export class QuickbooksClient {
               resolve();
             }, 1000);
           } catch (error) {
-            console.error('Error during token creation:', error);
-            res.writeHead(500, { 'Content-Type': 'text/html' });
-            res.end(`
-              <html>
-                <body style="
-                  display: flex;
-                  flex-direction: column;
-                  justify-content: center;
-                  align-items: center;
-                  height: 100vh;
-                  margin: 0;
-                  font-family: Arial, sans-serif;
-                  background-color: #fff0f0;
-                ">
-                  <h2 style="color: #d32f2f;">Error connecting to QuickBooks</h2>
-                  <p>Please check the console for more details.</p>
-                </body>
-              </html>
-            `);
+            console.error('Error during token creation:', error instanceof Error ? error.message : 'OAuth token exchange failed');
+            res.writeHead(302, { Location: '/error', 'Cache-Control': 'no-store' });
+            res.end();
             this.isAuthenticating = false;
             reject(error);
           }
@@ -435,8 +472,9 @@ export class QuickbooksClient {
       }
     };
 
-    if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
-    if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
+    const requireEncryption = this.environment === 'production';
+    if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', encryptStoredValue(this.refreshToken, requireEncryption));
+    if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', encryptStoredValue(this.realmId, requireEncryption));
 
     const newContent = envLines.join('\n');
     const isSymlink = this.isSymbolicLink(tokenPath);

@@ -150,15 +150,20 @@ async function uploadAttachableFile(
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("end", () => {
           const responseText = Buffer.concat(chunks).toString("utf-8");
+          const responseHeaders = res.headers ?? {};
+          const intuitTid = responseHeaders["intuit_tid"] ?? responseHeaders["intuit-tid"];
+          const traceSuffix = typeof intuitTid === "string" && intuitTid
+            ? ` [intuit_tid: ${intuitTid}]`
+            : "";
           if (res.statusCode && res.statusCode >= 400) {
-            console.error(`[qbo-attachable-upload] QBO ${res.statusCode}: ${responseText}`);
+            console.error(`[qbo-attachable-upload] QBO ${res.statusCode}${traceSuffix}`);
             reject(new Error(redactedUploadError(res.statusCode)));
             return;
           }
           try {
             resolve(JSON.parse(responseText) as unknown);
           } catch {
-            console.error(`[qbo-attachable-upload] QBO ${res.statusCode} non-JSON: ${responseText}`);
+            console.error(`[qbo-attachable-upload] QBO ${res.statusCode} returned non-JSON${traceSuffix}`);
             reject(new Error(redactedUploadError(res.statusCode)));
           }
         });

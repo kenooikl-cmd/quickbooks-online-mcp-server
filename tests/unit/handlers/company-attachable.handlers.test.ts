@@ -14,11 +14,16 @@ jest.unstable_mockModule('https', () => ({
   request: mockHttpsRequest,
 }));
 
-function mockHttpsUploadResponse(statusCode: number, responseBody: unknown) {
+function mockHttpsUploadResponse(
+  statusCode: number,
+  responseBody: unknown,
+  headers: Record<string, string> = {},
+) {
   const mockReq = { write: jest.fn(), end: jest.fn(), on: jest.fn() };
   (mockHttpsRequest as any).mockImplementation((_options: unknown, callback: (res: unknown) => void) => {
     const mockRes = {
       statusCode,
+      headers,
       on: jest.fn((event: string, handler: (...args: unknown[]) => void) => {
         if (event === 'data') {
           const payload = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody);
@@ -434,6 +439,33 @@ describe('Company and Attachable Handlers', () => {
       expect(result.error).toContain('QBO server error');
       expect(result.error).not.toContain('9341454900');
       expect(result.error).not.toContain('trace 7f8a9b');
+    });
+
+    it('logs an underscore Intuit trace header without logging the response body', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      mockHttpsUploadResponse(500, 'sensitive body', { intuit_tid: 'tid-underscore' });
+
+      await createQuickbooksAttachable({
+        file_name: 'doc.pdf',
+        content_type: 'application/pdf',
+        base64_content: Buffer.from('x').toString('base64'),
+      });
+
+      expect(errorSpy).toHaveBeenCalledWith('[qbo-attachable-upload] QBO 500 [intuit_tid: tid-underscore]');
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining('sensitive body'));
+    });
+
+    it('logs a hyphenated Intuit trace header', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      mockHttpsUploadResponse(500, 'sensitive body', { 'intuit-tid': 'tid-hyphen' });
+
+      await createQuickbooksAttachable({
+        file_name: 'doc.pdf',
+        content_type: 'application/pdf',
+        base64_content: Buffer.from('x').toString('base64'),
+      });
+
+      expect(errorSpy).toHaveBeenCalledWith('[qbo-attachable-upload] QBO 500 [intuit_tid: tid-hyphen]');
     });
 
     it('should redact network errors as generic message', async () => {

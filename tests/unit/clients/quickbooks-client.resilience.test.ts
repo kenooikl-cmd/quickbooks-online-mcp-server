@@ -264,7 +264,7 @@ describe('production dead-token handling', () => {
     const client = makeClient({ environment: 'production', refreshToken: '' });
     (client as unknown as { refreshToken?: string }).refreshToken = undefined;
 
-    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
+    await expect(client.authenticate()).rejects.toThrow(/public HTTPS URL ending in \/callback/);
     expect(serverCreated).toBe(false);
     expect(openMock).not.toHaveBeenCalled();
   });

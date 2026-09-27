@@ -387,12 +387,16 @@ If you only want to read your own company's data, you still need to set up an ap
 
 ### Production Setup
 
-The Intuit Developer Portal **rejects `http://localhost` redirect URIs in production mode** — every contributor hits this. Two known workarounds:
+The Intuit Developer Portal **requires a public HTTPS redirect URI in production**. The server still listens locally on port 8000, so expose that port through an HTTPS tunnel during authorization:
 
-1. **ngrok tunnel (most common):** run `ngrok http 8000`, then on your Intuit app go to **Settings → Redirect URIs** and add the generated `https://<id>.ngrok-free.app/callback` URL. Use that URL for the OAuth handshake, then revert to localhost afterwards.
-2. **Deploy a small public callback handler** (e.g., on a VPS or serverless function) that captures the auth code and hands it back to your local setup. More involved; only needed if you can't use ngrok.
+1. Start an HTTPS tunnel that forwards to `http://localhost:8000` (for example, Cloudflare Tunnel or ngrok).
+2. Add the tunnel callback URL, such as `https://<public-host>/callback`, to the production redirect URIs in your Intuit app.
+3. Set `QUICKBOOKS_REDIRECT_URI` to that exact HTTPS callback URL and run `npm run auth` while the tunnel is active.
+4. Keep the registered HTTPS URL configured for future reauthorization. The tunnel is not needed for normal API calls after authorization, but it must be available whenever OAuth is run again.
 
-After completing the production OAuth handshake, the refresh token is what matters — once it's in `.env`, you no longer need the public redirect URL for day-to-day use. Refresh tokens auto-rotate; the server persists the new token on each refresh.
+Production token storage also requires a separate 32-byte encryption key. Store a base64url-encoded key in a file outside the token `.env`, then set `QUICKBOOKS_TOKEN_ENCRYPTION_KEY_PATH` to its absolute path. The server encrypts the refresh token and realm ID with AES-256-GCM before persisting them. Back up the key securely: losing it makes the encrypted token store unreadable.
+
+After authorization, refresh tokens auto-rotate and the server persists the encrypted replacement on each refresh. The OAuth callback logs only the request path and redirects the browser to a clean success or error URL so authorization codes are not retained in page content or logs.
 
 ### Once you have tokens
 
